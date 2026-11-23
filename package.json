@@ -1,0 +1,12 @@
+{
+  "name": "family-tree-static-vue",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Static Vue 3 + D3 family tree editor, without a build step",
+  "scripts": {
+    "test": "node --test",
+    "demo:data": "node example.js"
+  },
+  "engines": { "node": ">=20" }
+}

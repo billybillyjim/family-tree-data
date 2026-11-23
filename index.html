@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="theme-color" content="#101820" />
+  <title>Family tree</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+<div id="app" v-cloak>
+  <header class="topbar">
+    <div class="top-actions">
+      <button class="primary" @click="openPaste">Paste record</button>
+      <button class="soft" @click="saveJsonFile">Save JSON</button>
+      <span v-if="saveStatus" class="save-status" :class="{error:saveError}">{{ saveStatus }}</span>
+      <button class="soft hide-small" @click="undo" :disabled="!history.length" title="Undo last change">↶ Undo</button>
+      <button class="soft hide-small" @click="redo" :disabled="!future.length" title="Redo last undo">↷ Redo</button>
+    </div>
+  </header>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-section">
+        <div class="section-heading"><span>PEOPLE</span><button class="icon-button" title="Add person" @click="createPerson">＋</button></div>
+        <input class="search" v-model="search" placeholder="Search names or years…" aria-label="Search people" />
+        <div class="search-meta">{{ filteredPeople.length }} of {{ personCount }} people</div>
+        <div class="people-list">
+          <button v-for="person in filteredPeople.slice(0, 120)" :key="person.id" class="person-result" :class="{active:selectedId===person.id}" @click="selectPerson(person.id,true)" @contextmenu="openContextMenu(person.id,$event) && $event.preventDefault()">
+            <span class="avatar">{{ initials(person) }}</span>
+            <span class="person-result-text"><strong>{{ fullName(person) }}</strong><small>{{ person.birth.date || 'Birth unknown' }} · {{ person.death.date || 'Death unknown' }}</small></span>
+          </button>
+          <div class="list-note" v-if="filteredPeople.length>120">Showing the first 120 results. Refine your search.</div>
+          <div class="empty-list" v-if="!filteredPeople.length">No matches.</div>
+        </div>
+      </div>
+      <div class="sidebar-bottom">
+        <button class="soft full" @click="createPerson">＋ Add person</button>
+      </div>
+    </aside>
+    <main class="map-area">
+      <canvas ref="graphCanvas" class="graph-canvas" aria-label="Family graph; drag to pan and scroll to zoom"></canvas>
+      <div class="map-top">
+        <div class="graph-label">
+          <strong>{{ personCount.toLocaleString() }} people</strong><span>{{ unionCount }} unions · {{ linkCount }} parent links</span>
+          <span v-show="missingHighlights" role="status">{{ missingHighlights?.size.toLocaleString() }} highlighted</span>
+        </div>
+        <div class="map-modes">
+          <label for="graph-highlight">Highlight</label>
+          <select id="graph-highlight" v-model="lineageMode" aria-label="Highlight">
+            <option value="none">Selected person</option>
+            <option value="ancestors">Ancestors</option>
+            <option value="descendants">Descendants</option>
+            <option value="both">Ancestors + descendants</option>
+            <option value="path">Path to person</option>
+            <option value="missing-parents">Missing Parents</option>
+            <option value="missing-dates">Missing DOB/DOD</option>
+          </select>
+          <select v-if="lineageMode==='path'" v-model="targetId"><option value="">Choose target…</option><option v-for="p in sortedPeople" :key="p.id" :value="p.id">{{ fullName(p) }}</option></select>
+        </div>
+      </div>
+      <div class="map-footer">
+        <div class="legend"><span><i class="dot biological"></i>Parent</span><span><i class="dot adopted"></i>Adoptive</span><span><i class="dot step"></i>Step</span><span><i class="dot marriage"></i>Union</span></div>
+        <div class="zoom-buttons"><button @click="graph?.zoomBy(0.75)" title="Zoom out">−</button><button @click="graph?.fit()" title="Fit all">Fit</button><button @click="graph?.zoomBy(1.35)" title="Zoom in">＋</button></div>
+      </div>
+      <div class="welcome" v-if="!personCount"><div class="welcome-actions"><button class="primary" @click="createPerson">Add first person</button></div></div>
+    </main>
+    <Teleport to="body" :disabled="panel!=='new'">
+    <div v-if="selectedPerson || panel==='new'" :class="panel==='new' ? 'modal-backdrop' : 'detail'" @click.self="panel==='new' && closePanel()">
+    <section class="person-editor" :class="{modal:panel==='new','person-modal':panel==='new'}" :role="panel==='new' ? 'dialog' : undefined" :aria-modal="panel==='new' ? 'true' : undefined" aria-labelledby="person-editor-title" @keydown="personEditorKeys">
+      <div class="detail-heading"><div><span class="eyebrow">{{ panel==='new' ? 'NEW RECORD' : 'PERSON DETAILS' }}</span><h2 id="person-editor-title">{{ panel==='new' ? (pendingCreation ? 'Create '+pendingCreation.role+' for '+nameById(pendingCreation.ownerId) : 'Add a person') : fullName(selectedPerson) }}</h2></div><button class="icon-button" title="Close" aria-label="Close person editor" @click="closePanel">✕</button></div>
+      <div class="detail-scroll">
+        <div class="tabs" v-if="panel!=='new'"><button :class="{current:tab==='details'}" @click="tab='details'">Details</button><button :class="{current:tab==='relationships'}" @click="tab='relationships'">Relationships</button></div>
+        <form v-if="tab==='details' || panel==='new'" @submit.prevent="savePerson">
+          <div v-if="panel==='new' && pendingCreation" class="relative-paste">
+            <label>Paste FamilySearch person entry<textarea ref="relativePasteInput" v-model="relativePasteText" rows="4" @input="relativePasteError=''"></textarea></label>
+            <p v-if="relativePasteError" class="paste-error" role="alert">{{ relativePasteError }}</p>
+            <button type="button" class="soft" :disabled="!relativePasteText.trim()" @click="fillRelativeForm">Fill fields</button>
+          </div>
+          <div class="portrait-row"><div class="portrait"><img v-if="form.image" :src="form.image" @error="imageError" alt="Person portrait" /><span v-else>{{ initialsFromForm }}</span></div></div>
+          <label>Photo URL or file path<input v-model.trim="form.image" placeholder="images/people/person.jpg" /></label>
+          <div class="form-grid"><label>Given names<input ref="givenNameInput" v-model.trim="form.given" placeholder="First and middle" /></label><label>Surname<input v-model.trim="form.surname" placeholder="Surname" /></label></div>
+          <div class="form-grid"><label>Birth surname<input v-model.trim="form.birthSurname" placeholder="Optional" /></label><label>Suffix<input v-model.trim="form.suffix" placeholder="Jr., III, etc." /></label></div>
+          <label>Preferred display name<input v-model.trim="form.display" placeholder="Optional override" /></label>
+          <label>Sex (optional)<select v-model="form.sex"><option value="">Unspecified</option><option value="female">Female</option><option value="male">Male</option><option value="other">Other</option><option value="unknown">Unknown</option></select></label>
+          <div class="field-group"><strong>Birth</strong><div class="form-grid"><label>Date<input v-model.trim="form.birthDate" placeholder="26 May 1821 / YYYY-MM-DD / YYYY" /></label><label>Place<input v-model.trim="form.birthPlace" placeholder="City, state, country" list="known-places" /></label></div></div>
+          <div class="field-group"><strong>Death</strong><div class="form-grid"><label>Date<input v-model.trim="form.deathDate" placeholder="26 May 1821 / YYYY-MM-DD / YYYY" /></label><label>Place<input v-model.trim="form.deathPlace" placeholder="City, state, country" list="known-places" /></label></div></div>
+          <datalist id="known-places"><option v-for="place in Object.values(snapshot.places)" :key="place.id" :value="place.name"></option></datalist>
+          <label>Notes<textarea v-model="form.notes" rows="4" placeholder="Biography, family history, sources…"></textarea></label>
+          <div class="form-actions"><button type="submit" class="primary full">{{ panel==='new' ? 'Create person' : 'Save changes' }}</button><button type="button" v-if="panel!=='new'" class="text-button danger-text" @click="deletePerson">Delete person…</button></div>
+        </form>
+        <div v-if="tab==='relationships' && panel!=='new'" class="relations">
+          <div class="relationship-section"><div class="relationship-title"><strong>Parents</strong><button class="mini-button" @click="openRelationship('parent')">＋ Add</button></div><div v-for="l in parents" :key="l.parentId+l.type" class="relationship-row"><button @click="selectPerson(l.parentId,true,'relationships')">{{ nameById(l.parentId) }}</button><span class="relation-type">{{ roleById(l.parentId,'parent') }}<template v-if="l.type!=='unknown'"> &middot; {{ l.type }}</template></span><button class="remove-button" title="Remove link" @click="removeLink(l)">×</button></div><p v-if="!parents.length" class="muted">No parents recorded.</p></div>
+          <div class="relationship-section"><div class="relationship-title"><strong>Children</strong><div class="bulk-actions"><button class="mini-button" @click="openBulkChildren">Add many</button><button class="mini-button" @click="openRelationship('child')">＋ Add</button></div></div><div v-for="l in children" :key="l.childId+l.type" class="relationship-row"><button @click="selectPerson(l.childId,true,'relationships')">{{ nameById(l.childId) }}</button><span class="relation-type">{{ roleById(l.childId,'child') }}<template v-if="l.type!=='unknown'"> &middot; {{ l.type }}</template></span><button class="remove-button" title="Remove link" @click="removeLink(l)">×</button></div><p v-if="!children.length" class="muted">No children recorded.</p></div>
+          <div class="relationship-section"><div class="relationship-title"><strong>Marriages & partnerships</strong><button class="mini-button" @click="openRelationship('union')">＋ Add</button></div><div v-for="u in unions" :key="u.id" class="relationship-row"><button @click="selectPerson(u.partnerIds.find(id=>id!==selectedId),true)">{{ nameById(u.partnerIds.find(id=>id!==selectedId)) }}</button><span class="relation-type">{{ u.type }} {{ u.start.date || '' }}</span><button class="mini-button" title="Edit union" @click="editUnion(u)">Edit</button><button class="remove-button" title="Remove union" @click="removeUnion(u)">×</button></div><p v-if="!unions.length" class="muted">No partnerships recorded.</p></div>
+          <div class="relationship-section"><strong>Lineage</strong><p class="muted">{{ ancestorCount }} ancestors · {{ descendantCount }} descendants (excluding step links)</p><button class="soft full" @click="lineageMode='ancestors';graph?.focus(selectedId)">Highlight ancestors</button><button class="soft full" @click="lineageMode='descendants';graph?.focus(selectedId)">Highlight descendants</button></div>
+        </div>
+      </div>
+    </section>
+    </div>
+    </Teleport>
+  </div>
+  <div v-if="pasteOpen" class="modal-backdrop" @click.self="pasteOpen=false">
+    <div class="modal paste-modal" role="dialog" aria-modal="true" aria-labelledby="paste-title">
+      <div class="modal-head"><h3 id="paste-title">Paste record</h3><button class="icon-button" aria-label="Close" @click="pasteOpen=false">&times;</button></div>
+      <form v-if="!pastedRecord" @submit.prevent="reviewPaste">
+        <label>Record text<textarea v-model="pastedText" rows="12" autofocus required></textarea></label>
+        <p v-if="pasteError" class="paste-error" role="alert">{{ pasteError }}</p>
+        <button class="primary" :disabled="!pastedText.trim()">Review</button>
+      </form>
+      <form v-else @submit.prevent="savePaste">
+        <label>Name<input v-model.trim="pastedRecord.name" required /></label>
+        <label>Person<select v-model="pastedRecord.existingId"><option value="">Create new person</option><option v-for="p in sortedPeople" :key="p.id" :value="p.id">Use existing: {{ fullName(p) }} ({{ p.birth.date || 'Birth unknown' }})</option></select></label>
+        <div class="form-grid"><label>Event<input v-model.trim="pastedRecord.event" /></label><label>Date<input v-model.trim="pastedRecord.date" placeholder="YYYY-MM-DD" /></label></div>
+        <label>Event place<input v-model.trim="pastedRecord.place" /></label>
+        <div class="form-grid"><label>Birth date<input v-model.trim="pastedRecord.birthDate" placeholder="26 May 1821" /></label><label>Birthplace<input v-model.trim="pastedRecord.birthPlace" /></label></div>
+        <p v-if="pastedRecord.birthEstimate" class="muted">{{ pastedRecord.birthEstimate }}</p>
+        <div class="form-grid"><label>Death date<input v-model.trim="pastedRecord.deathDate" placeholder="26 May 1821" /></label><label>Death place<input v-model.trim="pastedRecord.deathPlace" /></label></div>
+        <label>Sex<select v-model="pastedRecord.sex"><option value="">Unspecified</option><option value="male">Male</option><option value="female">Female</option></select></label>
+        <div class="paste-relationships">
+          <strong>Relatives</strong>
+          <div class="paste-relative-actions"><button v-for="role in ['mother','father','son','daughter']" :key="role" type="button" class="mini-button" @click="addPasteRelative(role)">Add {{ role }}</button></div>
+          <div v-for="(relative,i) in pastedRelatives" :key="i" class="paste-parent">
+            <div class="relationship-title"><strong class="relative-role">{{ relative.role }}</strong><button type="button" class="text-button danger-text" @click="removePasteRelative(relative)">Remove</button></div>
+            <people-picker v-model="relative.existingId" :people="sortedPeople" :modified="modifiedPeople" :exclude-id="pastedRecord.existingId"></people-picker>
+          </div>
+        </div>
+        <label>Notes<textarea v-model="pastedRecord.notes" rows="3"></textarea></label>
+        <div class="paste-actions"><button type="button" class="soft" @click="pastedRecord=null">Back</button><button class="primary" :disabled="pastedRelatives.some(p=>!p.existingId || p.existingId===pastedRecord.existingId)">Add record</button></div>
+      </form>
+    </div>
+  </div>
+  <div v-if="relationModal" class="modal-backdrop" @click.self="relationModal=null"><div class="modal" role="dialog" aria-modal="true"><div class="modal-head"><h3>{{ relationModal==='union' ? (editingUnionId ? 'Edit partnership' : 'Add partnership') : 'Add ' + relationModal }}</h3><button class="icon-button" @click="relationModal=null">✕</button></div><form @submit.prevent="saveRelationship"><template v-if="!editingUnionId"><people-picker v-model="relationship.otherId" :people="sortedPeople" :modified="modifiedPeople" :exclude-id="selectedId"></people-picker></template><template v-if="relationModal==='union'"><label>Partnership type<select v-model="relationship.type"><option value="marriage">Marriage</option><option value="partnership">Partnership</option><option value="unknown">Unknown</option></select></label><div class="form-grid"><label>Start date<input v-model.trim="relationship.start" placeholder="YYYY-MM-DD" /></label><label>End date<input v-model.trim="relationship.end" placeholder="YYYY-MM-DD" /></label></div><label v-if="relationship.end">End reason<select v-model="relationship.endReason"><option value="divorce">Divorce</option><option value="separation">Separation</option><option value="death">Death</option><option value="other">Other</option><option value="unknown">Unknown</option></select></label></template><template v-else><label>Relationship type<select v-model="relationship.type"><option value="biological">Biological</option><option value="adoptive">Adoptive</option><option value="step">Step</option><option value="unknown">Unknown</option></select></label></template><button class="primary full" type="submit">Save relationship</button></form></div></div>
+  <div v-if="bulkOpen" class="modal-backdrop" @click.self="closeBulkChildren">
+    <section ref="bulkElement" class="modal bulk-modal" role="dialog" aria-modal="true" aria-labelledby="bulk-title" @keydown="bulkKeys">
+      <div class="modal-head"><h3 id="bulk-title">Add many children</h3><button type="button" class="icon-button" aria-label="Close" @click="closeBulkChildren">&times;</button></div>
+      <form class="bulk-form" @submit.prevent="saveBulkChildren">
+        <div class="bulk-content">
+          <div class="bulk-parents">
+            <div class="picker-field"><span>Father</span><people-picker v-model="bulkFatherId" :people="sortedPeople" :modified="modifiedPeople" :exclude-id="bulkMotherEnabled ? bulkMotherId : ''"></people-picker></div>
+            <div class="picker-field"><label class="bulk-checkbox"><input type="checkbox" v-model="bulkMotherEnabled" />Mother</label><people-picker v-if="bulkMotherEnabled" v-model="bulkMotherId" :people="sortedPeople" :modified="modifiedPeople" :exclude-id="bulkFatherId"></people-picker></div>
+          </div>
+          <p v-if="bulkFatherSurname" class="muted">Birth surname: <strong>{{ bulkFatherSurname }}</strong></p>
+          <details class="bulk-paste">
+            <summary>Paste child records</summary>
+            <label>FamilySearch entries<textarea v-model="bulkText" rows="5"></textarea></label>
+            <label class="bulk-checkbox"><input type="checkbox" v-model="bulkTwoWordSurname" />Use the last two words as the surname</label>
+            <button type="button" class="soft" @click="fillBulkRows">Fill rows</button>
+          </details>
+          <div class="bulk-table-scroll">
+            <table class="bulk-table">
+              <thead><tr><th>Given names</th><th>Sex</th><th>Surname</th><th>Birth date</th><th>Birthplace</th><th>Death date</th><th>Death place</th><th></th></tr></thead>
+              <tbody><tr v-for="(row,i) in bulkRows" :key="i">
+                <td><input v-model.trim="row.given" :data-child-name="i" :aria-label="'Given names, child '+(i+1)" /></td>
+                <td><select v-model="row.sex" :aria-label="'Sex, child '+(i+1)"><option value="">Select</option><option value="male">Male</option><option value="female">Female</option></select></td>
+                <td><input v-if="row.sex==='male'" :value="row.pastedSurname || bulkFatherSurname" readonly :aria-label="'Surname, child '+(i+1)" /><input v-else v-model.trim="row.surname" :placeholder="bulkFatherSurname" :aria-label="'Surname, child '+(i+1)" /></td>
+                <td><input v-model.trim="row.birthDate" placeholder="27 October 1923" :aria-label="'Birth date, child '+(i+1)" /></td>
+                <td><input v-model.trim="row.birthPlace" :aria-label="'Birthplace, child '+(i+1)" /></td>
+                <td><input v-model.trim="row.deathDate" placeholder="17 December 2015" :aria-label="'Death date, child '+(i+1)" /></td>
+                <td><input v-model.trim="row.deathPlace" :aria-label="'Death place, child '+(i+1)" /></td>
+                <td><button type="button" class="remove-button" :aria-label="'Remove child '+(i+1)" @click="bulkRows.splice(i,1)">&times;</button></td>
+              </tr></tbody>
+            </table>
+          </div>
+          <button type="button" class="soft" @click="addBulkRow">Add row</button>
+        </div>
+        <div class="bulk-footer"><p v-if="bulkError" class="paste-error" role="alert">{{ bulkError }}</p><div class="bulk-actions"><button type="button" class="soft" @click="closeBulkChildren">Cancel</button><button class="primary" type="submit">Add children</button></div></div>
+      </form>
+    </section>
+  </div>
+  <div v-if="contextMenu" ref="contextMenuElement" class="person-context-menu" role="menu" aria-labelledby="context-person" :aria-describedby="contextMenu.mode==='link' ? 'context-other' : undefined" :style="{left:contextMenu.x+'px',top:contextMenu.y+'px'}" @keydown="contextMenuKeys" @contextmenu.prevent>
+    <div class="context-pair"><strong id="context-person">{{ nameById(contextMenu.selectedId) }}</strong><span v-if="contextMenu.mode==='link'" id="context-other">to {{ nameById(contextMenu.otherId) }}</span></div>
+    <template v-if="contextMenu.mode==='create'">
+      <button type="button" role="menuitem" @click="openBulkChildren">Add many children</button>
+      <button v-for="role in ['father','mother','daughter','son','wife','husband']" :key="role" type="button" role="menuitem" @click="createContextRelative(role)">Create {{ role.charAt(0).toUpperCase()+role.slice(1) }}</button>
+    </template>
+    <template v-else>
+      <button type="button" role="menuitem" @click="saveContextRelationship('married')" :title="nameById(contextMenu.selectedId)+' is married to '+nameById(contextMenu.otherId)">Married</button>
+      <button type="button" role="menuitem" @click="saveContextRelationship('parent')" :title="nameById(contextMenu.selectedId)+' is parent of '+nameById(contextMenu.otherId)">Is parent of</button>
+      <button type="button" role="menuitem" @click="saveContextRelationship('child')" :title="nameById(contextMenu.selectedId)+' is child of '+nameById(contextMenu.otherId)">Is child of</button>
+      <button type="button" role="menuitem" @click="explainContextRelationship">Explain Relationship</button>
+    </template>
+  </div>
+  <dialog v-if="relationshipExplanation" ref="relationshipDialog" class="modal relationship-explanation" aria-labelledby="relationship-explanation-title" aria-describedby="relationship-explanation-summary" @close="relationshipExplanation=null">
+    <div class="modal-head"><h3 id="relationship-explanation-title">Relationship</h3></div>
+    <p id="relationship-explanation-summary">{{ relationshipExplanation.summary }}</p>
+    <ul v-if="relationshipExplanation.paths" class="relationship-paths">
+      <li v-for="path in relationshipExplanation.paths" :key="path">{{ path }}</li>
+    </ul>
+    <form method="dialog"><button class="soft" autofocus>Close</button></form>
+  </dialog>
+  <div v-if="message" class="toast" :class="{bad:messageError}" role="status">{{ message }}<button @click="message=''">×</button></div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+<script type="module" src="./src/app/main.js"></script>
+</body>
+</html>
