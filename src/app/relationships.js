@@ -6,6 +6,10 @@ export function personRelationships(data, id) {
   };
 }
 
+export function recordedChildIds(data, parentId) {
+  return new Set(data.parentChild.filter(link => link.parentId === parentId).map(link => link.childId));
+}
+
 export function relationshipRole(person, direction) {
   if (direction === 'parent') {
     return person?.sex === 'female' ? 'Mother' : person?.sex === 'male' ? 'Father' : 'Parent';
@@ -33,18 +37,27 @@ export function createQuickRelationship(store, selectedId, otherId, action) {
 
 export function relativeCreation(person, role) {
   const kinds = { father: 'parent', mother: 'parent', daughter: 'child', son: 'child', wife: 'spouse', husband: 'spouse' };
-  if (!person || !kinds[role]) throw new Error('Choose a person and a valid relative role.');
+  const kind = kinds[role];
+  if (!person || !kind) throw new Error('Choose a person and a valid relative role.');
   const sex = ['father', 'son', 'husband'].includes(role) ? 'male' : 'female';
   const surname = role === 'father' ? person.name.birthSurname || person.name.surname
-    : kinds[role] === 'child' && person.sex === 'male' ? person.name.surname : '';
-  return { ownerId: person.id, role, kind: kinds[role], form: { sex, surname } };
+    : kind === 'child' && person.sex === 'male' ? person.name.surname : '';
+  return { ownerId: person.id, role, kind, form: { sex, surname }, ...(kind === 'spouse' ? { childIds: [] } : {}) };
 }
 
 export function linkCreatedRelative(data, newId, creation, makeId = () => crypto.randomUUID()) {
   if (!data.people[creation.ownerId] || !data.people[newId]) throw new Error('Both people must exist before creating the relationship.');
   if (creation.kind === 'spouse') {
+    const childIds = new Set(creation.childIds);
+    const existingChildren = recordedChildIds(data, creation.ownerId);
+    for (const childId of childIds) {
+      if (!existingChildren.has(childId)) throw new Error('A selected child is no longer linked to this person.');
+    }
     const id = makeId();
     data.unions[id] = { id, partnerIds: [creation.ownerId, newId], type: 'marriage', start: { date: null, placeId: null }, end: null };
+    for (const childId of childIds) {
+      data.parentChild.push({ parentId: newId, childId, type: 'unknown', unionId: id });
+    }
   } else if (creation.kind === 'parent' || creation.kind === 'child') {
     data.parentChild.push({
       parentId: creation.kind === 'parent' ? newId : creation.ownerId,

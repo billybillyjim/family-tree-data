@@ -8,5 +8,10 @@
     "test": "node --test",
     "demo:data": "node example.js"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "elkjs": "0.12.1"
+  }
 }

@@ -39,13 +39,38 @@
       </div>
     </aside>
     <main class="map-area">
-      <canvas ref="graphCanvas" class="graph-canvas" aria-label="Family graph; drag to pan and scroll to zoom"></canvas>
+      <canvas ref="graphCanvas" class="graph-canvas" :aria-label="layoutMode === 'force' ? 'Family graph. Drag a person to move them. Drag empty space to pan. Scroll to zoom.' : 'Family graph. Drag to pan and scroll to zoom.'"></canvas>
       <div class="map-top">
         <div class="graph-label">
           <strong>{{ personCount.toLocaleString() }} people</strong><span>{{ unionCount }} unions · {{ linkCount }} parent links</span>
           <span v-show="missingHighlights" role="status">{{ missingHighlights?.size.toLocaleString() }} highlighted</span>
+          <span v-if="layoutPending" role="status">Laying out tree…</span>
+          <span v-if="layoutMode==='timeline'">Birth year · oldest at top</span>
+          <span v-if="layoutMode==='generations'">Youngest generation at bottom</span>
+          <span v-if="layoutMode === 'force' && personCount">Drag a node to move it</span>
+          <span v-if="layoutError" class="layout-error" role="status">{{ layoutError }}</span>
         </div>
         <div class="map-modes">
+          <label for="graph-layout">Layout</label>
+          <select id="graph-layout" :value="layoutMode" aria-label="Layout" @change="changeLayout">
+            <option value="elk">ELK Layered</option>
+            <option value="stress">ELK Stress</option>
+            <option value="force">D3 Force Graph</option>
+            <option value="timeline">Timeline</option>
+            <option value="generations">Generations</option>
+            <option value="original">Original</option>
+            <option value="original-horizontal">Original Horizontal</option>
+          </select>
+          <template v-if="layoutMode === 'force'">
+            <button type="button" class="map-toggle" :aria-pressed="forceAutoEase" @click="forceAutoEase = !forceAutoEase">Auto-ease</button>
+            <button type="button" class="map-toggle" :aria-pressed="showSiblingLinks" @click="showSiblingLinks = !showSiblingLinks">Sibling links</button>
+            <button type="button" class="map-toggle" :aria-pressed="showMarriageLinks" @click="showMarriageLinks = !showMarriageLinks" title="Controls marriage and partnership links">Marriage links</button>
+          </template>
+          <label for="graph-card-colors">{{ layoutMode === 'force' ? 'Node colors' : 'Card colors' }}</label>
+          <select id="graph-card-colors" v-model="cardColors" :aria-label="layoutMode === 'force' ? 'Node colors' : 'Card colors'">
+            <option value="default">Default colors</option>
+            <option value="surname">Color by surname</option>
+          </select>
           <label for="graph-highlight">Highlight</label>
           <select id="graph-highlight" v-model="lineageMode" aria-label="Highlight">
             <option value="none">Selected person</option>
@@ -60,13 +85,31 @@
         </div>
       </div>
       <div class="map-footer">
-        <div class="legend"><span><i class="dot biological"></i>Parent</span><span><i class="dot adopted"></i>Adoptive</span><span><i class="dot step"></i>Step</span><span><i class="dot marriage"></i>Union</span></div>
-        <div class="zoom-buttons"><button @click="graph?.zoomBy(0.75)" title="Zoom out">−</button><button @click="graph?.fit()" title="Fit all">Fit</button><button @click="graph?.zoomBy(1.35)" title="Zoom in">＋</button></div>
+        <div class="map-legends">
+          <details v-if="surnameLegendEntries.length" class="surname-legend" open>
+            <summary>Surname colors</summary>
+            <ul>
+              <li v-for="entry in surnameLegendEntries" :key="entry.key">
+                <span class="surname-swatch" :style="{ backgroundColor: entry.color }" aria-hidden="true"></span>{{ entry.label }}
+              </li>
+            </ul>
+          </details>
+          <div v-if="layoutMode === 'force'" class="legend force-legend">
+            <span v-if="showMarriageLinks"><i class="dot marriage"></i>Marriage</span>
+            <span v-if="showMarriageLinks"><i class="dot partnership"></i>Partnership</span>
+            <span v-if="showSiblingLinks"><i class="dot sibling"></i>Sibling</span>
+            <span><i class="dot biological"></i>Parent</span>
+            <span><i class="dot adopted"></i>Adoptive</span>
+            <span><i class="dot step"></i>Step</span>
+          </div>
+          <div v-else class="legend"><span><i class="dot biological"></i>Parent</span><span><i class="dot adopted"></i>Adoptive</span><span><i class="dot step"></i>Step</span><span><i class="dot marriage"></i>Union</span></div>
+        </div>
+        <div class="zoom-buttons"><button @click="graph?.zoomBy(0.75)" title="Zoom out">−</button><button @click="fitGraph" title="Fit all">Fit</button><button @click="graph?.zoomBy(1.35)" title="Zoom in">＋</button></div>
       </div>
       <div class="welcome" v-if="!personCount"><div class="welcome-actions"><button class="primary" @click="createPerson">Add first person</button></div></div>
     </main>
     <Teleport to="body" :disabled="panel!=='new'">
-    <div v-if="selectedPerson || panel==='new'" :class="panel==='new' ? 'modal-backdrop' : 'detail'" @click.self="panel==='new' && closePanel()">
+    <div v-if="selectedPerson || panel==='new'" :class="panel==='new' ? 'modal-backdrop' : 'detail'" @pointerdown.self.left.prevent="panel==='new' && closePanel()">
     <section class="person-editor" :class="{modal:panel==='new','person-modal':panel==='new'}" :role="panel==='new' ? 'dialog' : undefined" :aria-modal="panel==='new' ? 'true' : undefined" aria-labelledby="person-editor-title" @keydown="personEditorKeys">
       <div class="detail-heading"><div><span class="eyebrow">{{ panel==='new' ? 'NEW RECORD' : 'PERSON DETAILS' }}</span><h2 id="person-editor-title">{{ panel==='new' ? (pendingCreation ? 'Create '+pendingCreation.role+' for '+nameById(pendingCreation.ownerId) : 'Add a person') : fullName(selectedPerson) }}</h2></div><button class="icon-button" title="Close" aria-label="Close person editor" @click="closePanel">✕</button></div>
       <div class="detail-scroll">
@@ -87,20 +130,27 @@
           <div class="field-group"><strong>Death</strong><div class="form-grid"><label>Date<input v-model.trim="form.deathDate" placeholder="26 May 1821 / YYYY-MM-DD / YYYY" /></label><label>Place<input v-model.trim="form.deathPlace" placeholder="City, state, country" list="known-places" /></label></div></div>
           <datalist id="known-places"><option v-for="place in Object.values(snapshot.places)" :key="place.id" :value="place.name"></option></datalist>
           <label>Notes<textarea v-model="form.notes" rows="4" placeholder="Biography, family history, sources…"></textarea></label>
+          <fieldset v-if="panel === 'new' && spouseChildren.length" class="spouse-children">
+            <legend>Link existing children</legend>
+            <label v-for="child in spouseChildren" :key="child.id">
+              <input type="checkbox" v-model="pendingCreation.childIds" :value="child.id" />
+              <span>{{ fullName(child) }} <small v-if="child.birth.date">({{ child.birth.date }})</small></span>
+            </label>
+          </fieldset>
           <div class="form-actions"><button type="submit" class="primary full">{{ panel==='new' ? 'Create person' : 'Save changes' }}</button><button type="button" v-if="panel!=='new'" class="text-button danger-text" @click="deletePerson">Delete person…</button></div>
         </form>
         <div v-if="tab==='relationships' && panel!=='new'" class="relations">
           <div class="relationship-section"><div class="relationship-title"><strong>Parents</strong><button class="mini-button" @click="openRelationship('parent')">＋ Add</button></div><div v-for="l in parents" :key="l.parentId+l.type" class="relationship-row"><button @click="selectPerson(l.parentId,true,'relationships')">{{ nameById(l.parentId) }}</button><span class="relation-type">{{ roleById(l.parentId,'parent') }}<template v-if="l.type!=='unknown'"> &middot; {{ l.type }}</template></span><button class="remove-button" title="Remove link" @click="removeLink(l)">×</button></div><p v-if="!parents.length" class="muted">No parents recorded.</p></div>
           <div class="relationship-section"><div class="relationship-title"><strong>Children</strong><div class="bulk-actions"><button class="mini-button" @click="openBulkChildren">Add many</button><button class="mini-button" @click="openRelationship('child')">＋ Add</button></div></div><div v-for="l in children" :key="l.childId+l.type" class="relationship-row"><button @click="selectPerson(l.childId,true,'relationships')">{{ nameById(l.childId) }}</button><span class="relation-type">{{ roleById(l.childId,'child') }}<template v-if="l.type!=='unknown'"> &middot; {{ l.type }}</template></span><button class="remove-button" title="Remove link" @click="removeLink(l)">×</button></div><p v-if="!children.length" class="muted">No children recorded.</p></div>
           <div class="relationship-section"><div class="relationship-title"><strong>Marriages & partnerships</strong><button class="mini-button" @click="openRelationship('union')">＋ Add</button></div><div v-for="u in unions" :key="u.id" class="relationship-row"><button @click="selectPerson(u.partnerIds.find(id=>id!==selectedId),true)">{{ nameById(u.partnerIds.find(id=>id!==selectedId)) }}</button><span class="relation-type">{{ u.type }} {{ u.start.date || '' }}</span><button class="mini-button" title="Edit union" @click="editUnion(u)">Edit</button><button class="remove-button" title="Remove union" @click="removeUnion(u)">×</button></div><p v-if="!unions.length" class="muted">No partnerships recorded.</p></div>
-          <div class="relationship-section"><strong>Lineage</strong><p class="muted">{{ ancestorCount }} ancestors · {{ descendantCount }} descendants (excluding step links)</p><button class="soft full" @click="lineageMode='ancestors';graph?.focus(selectedId)">Highlight ancestors</button><button class="soft full" @click="lineageMode='descendants';graph?.focus(selectedId)">Highlight descendants</button></div>
+          <div class="relationship-section"><strong>Lineage</strong><p class="muted">{{ ancestorCount }} ancestors · {{ descendantCount }} descendants (excluding step links)</p><button class="soft full" @click="lineageMode='ancestors';focusGraph(selectedId)">Highlight ancestors</button><button class="soft full" @click="lineageMode='descendants';focusGraph(selectedId)">Highlight descendants</button></div>
         </div>
       </div>
     </section>
     </div>
     </Teleport>
   </div>
-  <div v-if="pasteOpen" class="modal-backdrop" @click.self="pasteOpen=false">
+  <div v-if="pasteOpen" class="modal-backdrop" @pointerdown.self.left.prevent="pasteOpen=false">
     <div class="modal paste-modal" role="dialog" aria-modal="true" aria-labelledby="paste-title">
       <div class="modal-head"><h3 id="paste-title">Paste record</h3><button class="icon-button" aria-label="Close" @click="pasteOpen=false">&times;</button></div>
       <form v-if="!pastedRecord" @submit.prevent="reviewPaste">
@@ -130,8 +180,8 @@
       </form>
     </div>
   </div>
-  <div v-if="relationModal" class="modal-backdrop" @click.self="relationModal=null"><div class="modal" role="dialog" aria-modal="true"><div class="modal-head"><h3>{{ relationModal==='union' ? (editingUnionId ? 'Edit partnership' : 'Add partnership') : 'Add ' + relationModal }}</h3><button class="icon-button" @click="relationModal=null">✕</button></div><form @submit.prevent="saveRelationship"><template v-if="!editingUnionId"><people-picker v-model="relationship.otherId" :people="sortedPeople" :modified="modifiedPeople" :exclude-id="selectedId"></people-picker></template><template v-if="relationModal==='union'"><label>Partnership type<select v-model="relationship.type"><option value="marriage">Marriage</option><option value="partnership">Partnership</option><option value="unknown">Unknown</option></select></label><div class="form-grid"><label>Start date<input v-model.trim="relationship.start" placeholder="YYYY-MM-DD" /></label><label>End date<input v-model.trim="relationship.end" placeholder="YYYY-MM-DD" /></label></div><label v-if="relationship.end">End reason<select v-model="relationship.endReason"><option value="divorce">Divorce</option><option value="separation">Separation</option><option value="death">Death</option><option value="other">Other</option><option value="unknown">Unknown</option></select></label></template><template v-else><label>Relationship type<select v-model="relationship.type"><option value="biological">Biological</option><option value="adoptive">Adoptive</option><option value="step">Step</option><option value="unknown">Unknown</option></select></label></template><button class="primary full" type="submit">Save relationship</button></form></div></div>
-  <div v-if="bulkOpen" class="modal-backdrop" @click.self="closeBulkChildren">
+  <div v-if="relationModal" class="modal-backdrop" @pointerdown.self.left.prevent="relationModal=null"><div class="modal" role="dialog" aria-modal="true"><div class="modal-head"><h3>{{ relationModal==='union' ? (editingUnionId ? 'Edit partnership' : 'Add partnership') : 'Add ' + relationModal }}</h3><button class="icon-button" @click="relationModal=null">✕</button></div><form @submit.prevent="saveRelationship"><template v-if="!editingUnionId"><people-picker v-model="relationship.otherId" :people="sortedPeople" :modified="modifiedPeople" :exclude-id="selectedId"></people-picker></template><template v-if="relationModal==='union'"><label>Partnership type<select v-model="relationship.type"><option value="marriage">Marriage</option><option value="partnership">Partnership</option><option value="unknown">Unknown</option></select></label><div class="form-grid"><label>Start date<input v-model.trim="relationship.start" placeholder="YYYY-MM-DD" /></label><label>End date<input v-model.trim="relationship.end" placeholder="YYYY-MM-DD" /></label></div><label v-if="relationship.end">End reason<select v-model="relationship.endReason"><option value="divorce">Divorce</option><option value="separation">Separation</option><option value="death">Death</option><option value="other">Other</option><option value="unknown">Unknown</option></select></label></template><template v-else><label>Relationship type<select v-model="relationship.type"><option value="biological">Biological</option><option value="adoptive">Adoptive</option><option value="step">Step</option><option value="unknown">Unknown</option></select></label></template><button class="primary full" type="submit">Save relationship</button></form></div></div>
+  <div v-if="bulkOpen" class="modal-backdrop" @pointerdown.self.left.prevent="closeBulkChildren">
     <section ref="bulkElement" class="modal bulk-modal" role="dialog" aria-modal="true" aria-labelledby="bulk-title" @keydown="bulkKeys">
       <div class="modal-head"><h3 id="bulk-title">Add many children</h3><button type="button" class="icon-button" aria-label="Close" @click="closeBulkChildren">&times;</button></div>
       <form class="bulk-form" @submit.prevent="saveBulkChildren">

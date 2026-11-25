@@ -96,7 +96,7 @@ function partnershipBlocks(ids, unionsByPerson, rank) {
   return { blocks, blockByPerson };
 }
 
-function rankAncestry(groups, groupByPerson, links) {
+function rankAncestry(groups, groupByPerson, links, fromYoungest) {
   const descendants = new Map(groups.map(group => [group, new Set()]));
   const indegree = new Map(groups.map(group => [group, 0]));
   for (const link of links) {
@@ -112,24 +112,37 @@ function rankAncestry(groups, groupByPerson, links) {
   for (let i = 0; i < ordered.length; i++) {
     const parent = ordered[i];
     for (const child of descendants.get(parent)) {
-      child.depth = Math.max(child.depth, parent.depth + 1);
+      if (!fromYoungest) child.depth = Math.max(child.depth, parent.depth + 1);
       indegree.set(child, indegree.get(child) - 1);
       if (indegree.get(child) === 0) ordered.push(child);
     }
   }
   if (ordered.length !== groups.length) return false;
 
-  // Bring shorter ancestry branches down toward their first child.
+  // In the bottom-up view, terminal groups start at zero before the rows
+  // are shifted into view. In Original, bring shorter branches toward their first child.
   for (let i = ordered.length - 1; i >= 0; i--) {
     const group = ordered[i];
+    if (fromYoungest) group.depth = 0;
     let firstChild = Infinity;
     for (const child of descendants.get(group)) firstChild = Math.min(firstChild, child.depth);
     if (firstChild < Infinity) group.depth = firstChild - 1;
   }
+  if (fromYoungest) {
+    // Keep the longest descent anchored at the bottom. A shorter side branch
+    // can end earlier when that keeps it close to its recorded parents.
+    const earliest = new Map();
+    for (const group of ordered) {
+      if (earliest.has(group)) group.depth = earliest.get(group);
+      for (const child of descendants.get(group)) {
+        earliest.set(child, Math.max(earliest.get(child) ?? -Infinity, group.depth + 1));
+      }
+    }
+  }
   return true;
 }
 
-function rankWithSiblings(blocks, blockByPerson, links) {
+function rankWithSiblings(blocks, blockByPerson, links, fromYoungest) {
   const groupFor = new Map(blocks.map(block => [block, block]));
   function find(block) {
     while (groupFor.get(block) !== block) {
@@ -152,7 +165,7 @@ function rankWithSiblings(blocks, blockByPerson, links) {
     if (!siblingGroups.has(root)) siblingGroups.set(root, { depth: 0 });
     for (const id of block.ids) groupByPerson.set(id, siblingGroups.get(root));
   }
-  if (!rankAncestry([...siblingGroups.values()], groupByPerson, links)) return false;
+  if (!rankAncestry([...siblingGroups.values()], groupByPerson, links, fromYoungest)) return false;
   for (const block of blocks) block.depth = groupByPerson.get(block.ids[0]).depth;
   return true;
 }
@@ -212,7 +225,7 @@ function orderPartners(block, blockByPerson, unionsByPerson, people, comparePeop
   block.ids = [...left.reverse(), pivot, ...right];
 }
 
-function alignJoinedBranches(blocks, families, owner, blockByPerson, indexByPerson) {
+function alignJoinedBranches(blocks, families, owner, blockByPerson, indexByPerson, cardWidth) {
   const rowByDepth = new Map(), unitByBlock = new Map(), offsets = new Map();
   for (const block of [...blocks].sort((a, b) => a.x - b.x)) {
     if (!rowByDepth.has(block.depth)) rowByDepth.set(block.depth, new Map());
@@ -223,7 +236,7 @@ function alignJoinedBranches(blocks, families, owner, blockByPerson, indexByPers
     if (unit.members.length) unit.width += SIBLING_GAP;
     unit.members.push({ block, offset: unit.width });
     for (const id of block.ids) {
-      offsets.set(id, unit.width + indexByPerson.get(id) * (CARD_WIDTH + PARTNER_GAP) + CARD_WIDTH / 2);
+      offsets.set(id, unit.width + indexByPerson.get(id) * (cardWidth + PARTNER_GAP) + cardWidth / 2);
     }
     unit.width += block.cardWidth;
     unitByBlock.set(block, unit);
@@ -296,12 +309,12 @@ function alignJoinedBranches(blocks, families, owner, blockByPerson, indexByPers
   }
 }
 
-function placeBranches(blocks, blockByPerson, families, comparePeople) {
+function placeBranches(blocks, blockByPerson, families, comparePeople, cardWidth, cardHeight) {
   const indexByPerson = new Map();
   const owner = new Map();
   for (const block of blocks) {
     block.ids.forEach((id, index) => indexByPerson.set(id, index));
-    block.cardWidth = block.ids.length * (CARD_WIDTH + PARTNER_GAP) - PARTNER_GAP;
+    block.cardWidth = block.ids.length * (cardWidth + PARTNER_GAP) - PARTNER_GAP;
   }
   for (const family of families) {
     const source = family.sourceIds.map(id => blockByPerson.get(id)).reduce((a, b) => a.depth >= b.depth ? a : b);
@@ -365,7 +378,7 @@ function placeBranches(blocks, blockByPerson, families, comparePeople) {
     return placement && !link.types.every(type => type === 'step')
       && (placement.family !== family || placement.distance > 1);
   }));
-  if (joined) alignJoinedBranches(blocks, families, owner, blockByPerson, indexByPerson);
+  if (joined) alignJoinedBranches(blocks, families, owner, blockByPerson, indexByPerson, cardWidth);
 
   let left = Infinity, right = -Infinity;
   for (const block of blocks) {
@@ -375,7 +388,7 @@ function placeBranches(blocks, blockByPerson, families, comparePeople) {
   const nodes = new Map(), rows = new Map();
   for (const block of ordered) {
     block.ids.forEach((id, index) => {
-      const node = { id, x: block.x - left + index * (CARD_WIDTH + PARTNER_GAP), y: 0, w: CARD_WIDTH, h: CARD_HEIGHT, depth: block.depth };
+      const node = { id, x: block.x - left + index * (cardWidth + PARTNER_GAP), y: 0, w: cardWidth, h: cardHeight, depth: block.depth };
       nodes.set(id, node);
       addTo(rows, node.depth, node);
     });
@@ -384,7 +397,7 @@ function placeBranches(blocks, blockByPerson, families, comparePeople) {
   return { nodes, rows, width: right - left };
 }
 
-export function arrangeFamilies(ids, links, unions, people) {
+export function arrangeFamilies(ids, links, unions, people, { horizontal = false, fromYoungest = false } = {}) {
   const comparePeople = (a, b) => birthOrder(people[a], people[b]);
   ids = [...ids].sort(comparePeople);
   const unionsByPerson = new Map(ids.map(id => [id, []]));
@@ -392,14 +405,15 @@ export function arrangeFamilies(ids, links, unions, people) {
     for (const id of union.partnerIds) unionsByPerson.get(id).push(union);
   }
   let { blocks, blockByPerson } = partnershipBlocks(ids, unionsByPerson);
-  if (!rankWithSiblings(blocks, blockByPerson, links) && !rankAncestry(blocks, blockByPerson, links)) {
+  if (!rankWithSiblings(blocks, blockByPerson, links, fromYoungest) && !rankAncestry(blocks, blockByPerson, links, fromYoungest)) {
     // Cross-generation partnerships can make a common rank impossible.
     const individuals = ids.map(id => ({ ids: [id], depth: 0 }));
-    rankAncestry(individuals, new Map(individuals.map(group => [group.ids[0], group])), links);
+    rankAncestry(individuals, new Map(individuals.map(group => [group.ids[0], group])), links, fromYoungest);
     const rank = new Map(individuals.map(group => [group.ids[0], group.depth]));
     ({ blocks, blockByPerson } = partnershipBlocks(ids, unionsByPerson, rank));
   }
   for (const block of blocks) orderPartners(block, blockByPerson, unionsByPerson, people, comparePeople);
   const families = collectFamilies(links, unions, comparePeople);
-  return { ...placeBranches(blocks, blockByPerson, families, comparePeople), families };
+  const [cardWidth, cardHeight] = horizontal ? [CARD_HEIGHT, CARD_WIDTH] : [CARD_WIDTH, CARD_HEIGHT];
+  return { ...placeBranches(blocks, blockByPerson, families, comparePeople, cardWidth, cardHeight), families };
 }

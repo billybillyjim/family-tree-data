@@ -35,16 +35,50 @@ function connectedComponents(ids, links, unions) {
   return components.sort((a, b) => b.ids.length - a.ids.length);
 }
 
-export function buildLayout(data) {
+function arrangeSharedRows(components, people) {
+  const nodes = new Map(), rows = new Map(), families = [];
+  let width = 0, firstDepth = 0;
+  for (const component of components) {
+    const layout = arrangeFamilies(component.ids, component.links, component.unions, people, { fromYoungest: true });
+    if (nodes.size) width += COMPONENT_GAP;
+    for (const node of layout.nodes.values()) {
+      node.x += width;
+      firstDepth = Math.min(firstDepth, node.depth);
+      nodes.set(node.id, node);
+    }
+    for (const family of layout.families) families.push(family);
+    width += layout.width;
+  }
+  for (const node of nodes.values()) {
+    node.depth -= firstDepth;
+    if (!rows.has(node.depth)) rows.set(node.depth, []);
+    rows.get(node.depth).push(node);
+  }
+  for (const row of rows.values()) row.sort((a, b) => a.x - b.x);
+  return { nodes, rows, families, width };
+}
+
+function* layoutComponents(components, people, unions, { horizontal, fromYoungest }) {
+  if (fromYoungest) {
+    if (components.length) yield [arrangeSharedRows(components, people), unions];
+    return;
+  }
+  for (const component of components) {
+    yield [arrangeFamilies(component.ids, component.links, component.unions, people, { horizontal }), component.unions];
+  }
+}
+
+export function buildLayout(data, { horizontal = false, fromYoungest = false } = {}) {
   const { people, parentChild: parentLinks } = data;
   const ids = Object.keys(people).sort((a, b) => birthOrder(people[a], people[b]));
   const unions = Object.values(data.unions).sort(unionOrder);
   const nodes = new Map(), unionRoutes = new Map(), parentConnectors = [];
   const bounds = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
   let offset = 0;
-  for (const component of connectedComponents(ids, parentLinks, unions)) {
-    const layout = arrangeFamilies(component.ids, component.links, component.unions, people);
-    const routes = routeFamilies(layout, component.unions);
+  const components = connectedComponents(ids, parentLinks, unions);
+  for (const [layout, componentUnions] of layoutComponents(components, people, unions, { horizontal, fromYoungest })) {
+    // Route in generation-row coordinates, then transpose the geometry for the horizontal view.
+    const routes = routeFamilies(layout, componentUnions);
     const moved = new Set();
     function translateRoute(route) {
       for (const point of route) {
@@ -52,12 +86,17 @@ export function buildLayout(data) {
         if (moved.has(point)) continue;
         moved.add(point);
         point[0] += offset;
+        if (horizontal) [point[0], point[1]] = [point[1], point[0]];
         bounds.maxX = Math.max(bounds.maxX, point[0]);
         bounds.maxY = Math.max(bounds.maxY, point[1]);
       }
     }
     for (const node of layout.nodes.values()) {
       node.x += offset;
+      if (horizontal) {
+        [node.x, node.y] = [node.y, node.x];
+        [node.w, node.h] = [node.h, node.w];
+      }
       bounds.maxX = Math.max(bounds.maxX, node.x + node.w);
       bounds.maxY = Math.max(bounds.maxY, node.y + node.h);
       nodes.set(node.id, node);
@@ -70,7 +109,7 @@ export function buildLayout(data) {
       translateRoute(connector.route);
       parentConnectors.push(connector);
     }
-    offset = bounds.maxX + COMPONENT_GAP;
+    offset = (horizontal ? bounds.maxY : bounds.maxX) + COMPONENT_GAP;
   }
   return { nodes, bounds, parentLinks, parentConnectors, unions, unionRoutes, count: ids.length };
 }

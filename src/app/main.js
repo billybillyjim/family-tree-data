@@ -1,14 +1,18 @@
 import { FamilyStore } from '../data/index.js';
 import { buildLayout, getLineage, getMissingDataHighlights, personName } from './graph.js';
 import { GraphCanvas } from './canvas.js';
+import { birthOrder } from './family-layout.js';
+import { buildForceLayout } from './force-layout.js';
+import { buildTimelineLayout } from './timeline-layout.js';
+import { surnameLegend } from './surname-colors.js';
 import { explainRelationship } from './kinship.js';
 import { loadDraft, loadModified, saveDraft, downloadJson } from './persistence.js';
 import { parsePersonEntries, parseRecord, addPastedRecord, personDate } from './paste.js';
-import { personRelationships, relationshipRole, createQuickRelationship, relativeCreation, linkCreatedRelative } from './relationships.js';
+import { personRelationships, recordedChildIds, relationshipRole, createQuickRelationship, relativeCreation, linkCreatedRelative } from './relationships.js';
 import { PeoplePicker, changedPeople } from './people-picker.js';
 import { blankChild, parseChildren, addChildren } from './children.js';
 
-const { createApp, ref, computed, watch, onMounted, onBeforeUnmount, nextTick } = Vue;
+const { createApp, ref, computed, watch, onMounted, onBeforeUnmount, nextTick, toRaw } = Vue;
 const blankForm = () => ({ given: '', surname: '', birthSurname: '', suffix: '', display: '', sex: '', birthDate: '', birthPlace: '', deathDate: '', deathPlace: '', image: '', notes: '' });
 const blankRelationship = () => ({ otherId: '', type: 'biological', start: '', end: '', endReason: 'divorce' });
 
@@ -65,7 +69,7 @@ createApp({
         catch (error) { bulkError.value = error.message; throw error; }
       });
       if (result) {
-        closeBulkChildren(); selectPerson(bulkFatherId.value, false, 'relationships'); graph?.fit();
+        closeBulkChildren(); selectPerson(bulkFatherId.value, false, 'relationships'); fitGraph();
         notify(`${result.length} children added.`);
       }
     }
@@ -78,6 +82,12 @@ createApp({
       else if (!event.shiftKey && document.activeElement === fields.at(-1)) { event.preventDefault(); fields[0]?.focus(); }
     }
     const pendingCreation = ref(null);
+    const spouseChildren = computed(() => {
+      const creation = pendingCreation.value;
+      if (creation?.kind !== 'spouse') return [];
+      const family = snapshot.value;
+      return [...recordedChildIds(family, creation.ownerId)].map(id => family.people[id]).sort(birthOrder);
+    });
     const givenNameInput = ref(null);
     const relativePasteInput = ref(null), relativePasteText = ref(''), relativePasteError = ref('');
     let createPersonTrigger = null;
@@ -199,6 +209,13 @@ createApp({
     const message = ref(''), messageError = ref(false);
     let graph = null;
     const graphRef = ref(null);
+    const layoutMode = ref('elk'), layoutPending = ref(false);
+    const forceAutoEase = ref(false);
+    const showSiblingLinks = ref(true), showMarriageLinks = ref(true);
+    const layoutError = ref('');
+    const cardColors = ref('default');
+    const surnameLegendEntries = computed(() => cardColors.value === 'surname' ? surnameLegend(snapshot.value.people) : []);
+    let layoutWorker, layoutRequest = 0, layoutTimer, afterLayout;
     const selectedPerson = computed(() => selectedId.value ? snapshot.value.people[selectedId.value] || null : null);
     const sortedPeople = computed(() => Object.values(snapshot.value.people).sort((a, b) => personName(a).localeCompare(personName(b))));
     const filteredPeople = computed(() => {
@@ -222,12 +239,92 @@ createApp({
     const nameById = id => snapshot.value.people[id] ? personName(snapshot.value.people[id]) : 'Unknown';
     function saveJsonFile() { downloadJson(store.toJSON()); }
     function notify(text, error = false) { message.value = text; messageError.value = error; }
+    function moveGraph(move) {
+      if (layoutPending.value) afterLayout = move;
+      else if (graph) move(graph);
+    }
+    function fitGraph() { moveGraph(canvas => canvas.fit()); }
+    function focusGraph(id) { moveGraph(canvas => canvas.focus(id)); }
+    function changeLayout(event) {
+      if (layoutPending.value) {
+        layoutWorker?.terminate();
+        layoutWorker = null;
+      }
+      layoutMode.value = event.target.value;
+      updateGraph(true);
+    }
     function updateGraph(shouldFit = false) {
       if (!graph) { return; }
-      const layout = buildLayout(snapshot.value);
-      graph.setData(snapshot.value, layout);
-      highlight();
-      if (shouldFit) { graph.fit(); }
+      const family = toRaw(snapshot.value);
+      const mode = layoutMode.value;
+      const request = ++layoutRequest;
+      clearTimeout(layoutTimer);
+      if (shouldFit) layoutError.value = '';
+      if (shouldFit) afterLayout = canvas => canvas.fit();
+      function show(layout) {
+        if (request !== layoutRequest) return;
+        clearTimeout(layoutTimer);
+        layoutPending.value = false;
+        graph.setData(family, layout);
+        highlight();
+        const move = afterLayout;
+        afterLayout = null;
+        move?.(graph);
+      }
+      function useOriginal(reason) {
+        if (request !== layoutRequest) return;
+        layoutWorker?.terminate();
+        layoutWorker = null;
+        layoutError.value = `${mode === 'stress' ? 'ELK Stress' : 'ELK Layered'}: ${reason} Showing Original.`;
+        layoutMode.value = 'original';
+        show(buildLayout(family));
+      }
+      if (['original', 'original-horizontal', 'generations', 'timeline', 'force'].includes(mode) || !Object.keys(family.people).length) {
+        if (layoutPending.value) {
+          layoutWorker?.terminate();
+          layoutWorker = null;
+        }
+        if (mode === 'force') {
+          show(buildForceLayout(family, {
+            animate: !matchMedia('(prefers-reduced-motion: reduce)').matches,
+            previousNodes: graph.layout?.forceLinks ? graph.layout.nodes : undefined,
+            showSiblings: showSiblingLinks.value,
+            showMarriages: showMarriageLinks.value
+          }));
+          return;
+        }
+        show(mode === 'timeline' ? buildTimelineLayout(family) : buildLayout(family, {
+          horizontal: mode === 'original-horizontal',
+          fromYoungest: mode === 'generations'
+        }));
+        return;
+      }
+      if (mode === 'stress' && layoutPending.value) {
+        layoutWorker?.terminate();
+        layoutWorker = null;
+      }
+      layoutPending.value = true;
+      try {
+        layoutWorker ??= new Worker(new URL('./elk-worker.js', import.meta.url));
+        layoutWorker.onmessage = ({ data }) => {
+          if (data.request !== request || request !== layoutRequest) return;
+          if (data.started) {
+            if (mode === 'stress') clearTimeout(layoutTimer);
+          } else if (data.layout) {
+            show(data.layout);
+          } else {
+            useOriginal(data.error || 'The worker returned no layout.');
+          }
+        };
+        layoutWorker.onerror = event => useOriginal(event.message || 'The layout worker stopped.');
+        layoutWorker.onmessageerror = () => useOriginal('The layout could not be read.');
+        layoutTimer = setTimeout(() => useOriginal(mode === 'stress'
+          ? 'The worker did not start within 15 seconds.'
+          : 'The layout did not finish within 15 seconds.'), 15000);
+        layoutWorker.postMessage({ request, family, mode });
+      } catch (error) {
+        useOriginal(error.message || 'The layout worker could not start.');
+      }
     }
     function highlight() {
       if (!graph) { return; }
@@ -297,7 +394,7 @@ createApp({
       if (!snapshot.value.people[id]) { return; }
       selectedId.value = id; panel.value = 'edit'; tab.value = selectedTab;
       hydrateForm(); highlight();
-      if (focus) { graph?.focus(id); }
+      if (focus) { focusGraph(id); }
     }
     function closePanel() {
       const wasNew = panel.value === 'new';
@@ -383,6 +480,11 @@ createApp({
       commit(() => { store.removeUnion(u.id); return true; });
     }
     watch([lineageMode, targetId], highlight);
+    watch(cardColors, mode => graph?.setColorBySurname(mode === 'surname'));
+    watch([layoutMode, forceAutoEase], ([mode, enabled]) => graph?.setForceAutoEase(mode === 'force' && enabled));
+    watch([showSiblingLinks, showMarriageLinks], () => {
+      if (layoutMode.value === 'force') updateGraph();
+    });
     watch([selectedId, snapshot, pasteOpen, relationModal, bulkOpen], closeContextMenu);
     onMounted(async () => {
       document.addEventListener('pointerdown', dismissContextMenu);
@@ -408,6 +510,8 @@ createApp({
     });
     onBeforeUnmount(() => {
       clearTimeout(draftTimer); graph?.destroy();
+      layoutRequest++;
+      clearTimeout(layoutTimer); layoutWorker?.terminate();
       document.removeEventListener('pointerdown', dismissContextMenu);
       document.removeEventListener('keydown', contextEscape);
       window.removeEventListener('resize', closeContextMenu);
@@ -418,13 +522,15 @@ createApp({
       openBulkChildren, closeBulkChildren, addBulkRow, fillBulkRows, saveBulkChildren, bulkKeys,
       contextMenu, contextMenuElement, contextMenuKeys, openContextMenu, saveContextRelationship,
       relationshipExplanation, relationshipDialog, explainContextRelationship,
-      createContextRelative, pendingCreation,
+      createContextRelative, pendingCreation, spouseChildren,
       relativePasteInput, relativePasteText, relativePasteError, fillRelativeForm,
       givenNameInput, personEditorKeys,
       pasteOpen, pastedText, pastedRecord, pasteError, openPaste, reviewPaste, savePaste,
       pastedRelatives, addPasteRelative, removePasteRelative,
       snapshot, modifiedPeople, search, selectedId, selectedPerson, panel, tab, form, relationModal, editingUnionId, relationship,
       lineageMode, targetId, missingHighlights, graph: graphRef, graphCanvas, saveStatus, saveError, message, messageError,
+      layoutMode, layoutPending, layoutError, forceAutoEase, showSiblingLinks, showMarriageLinks,
+      cardColors, surnameLegendEntries, changeLayout, fitGraph, focusGraph,
       sortedPeople, filteredPeople, parents, children, unions, ancestorCount, descendantCount, personCount, unionCount, linkCount,
       initialsFromForm, initials, fullName, nameById, roleById, imageError, selectPerson, closePanel, createPerson, savePerson, deletePerson,
       openRelationship, editUnion, saveRelationship, removeLink, removeUnion,

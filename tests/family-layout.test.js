@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import ELK from 'elkjs';
+import { buildElkLayout } from '../src/app/elk-layout.js';
 import { buildLayout } from '../src/app/graph.js';
+import { stressRouter } from '../src/app/stress-routes.js';
+import { buildTimelineLayout } from '../src/app/timeline-layout.js';
 
 function pedigree() {
   const data = { people: {}, unions: {}, places: {}, parentChild: [] };
@@ -239,4 +243,205 @@ test('lays out deep and wide branches without recursion', () => {
   assert.equal(layout.parentConnectors.length, 9000);
   assert.equal(layout.nodes.get('sibling 2999').depth, 6001);
   assertSeparated(layout);
+});
+
+test('Original Horizontal keeps cards upright and uses the original family order and junctions', () => {
+  const { data, person, union, link } = pedigree();
+  const parent = person('parent'), partner = person('partner');
+  const first = union('first', parent, partner, '1880');
+  const second = union('second', parent, partner, '1900');
+  const older = person('older', '1882'), younger = person('younger', '1884');
+  const halfSibling = person('half sibling', '1903'), grandchild = person('grandchild', '1911');
+  const isolated = person('isolated');
+  for (const [child, marriage] of [[younger, first], [halfSibling, second], [older, first]]) {
+    link(parent, child, marriage);
+    link(partner, child, marriage);
+  }
+  link(older, grandchild);
+  link(halfSibling, grandchild, null, 'step');
+
+  const vertical = buildLayout(data);
+  const horizontal = buildLayout(data, { horizontal: true });
+  assertClearRoutes(horizontal);
+  for (const node of horizontal.nodes.values()) {
+    const original = vertical.nodes.get(node.id);
+    assert.deepEqual([node.w, node.h, node.depth], [original.w, original.h, original.depth]);
+  }
+  const card = id => horizontal.nodes.get(id);
+  assert.ok(card(parent).x < card(older).x && card(older).x < card(grandchild).x);
+  assert.equal(card(older).x, card(younger).x);
+  assert.ok(card(older).y + card(older).h < card(younger).y);
+  assert.ok(card(isolated).y > card(grandchild).y + card(grandchild).h);
+  const siblings = horizontal.parentConnectors.filter(connector => connector.unionId === first);
+  const other = horizontal.parentConnectors.find(connector => connector.unionId === second);
+  assert.deepEqual(siblings.map(connector => connector.childId), [older, younger]);
+  assert.deepEqual(siblings[0].from, siblings[1].from);
+  assert.notDeepEqual(siblings[0].from, other.from);
+  for (const connector of [...siblings, other]) {
+    assert.equal(connector.to[0], card(connector.childId).x);
+    const route = horizontal.unionRoutes.get(connector.unionId);
+    assert.ok(route.some(([x, y], i) => i > 0
+      && x === connector.from[0] && route[i - 1][0] === x
+      && Math.min(y, route[i - 1][1]) <= connector.from[1]
+      && connector.from[1] <= Math.max(y, route[i - 1][1])));
+  }
+});
+
+test('Generations aligns branches from the youngest row and keeps shorter side branches near their parents', () => {
+  const { data, person, union, link } = pedigree();
+  const a = person('great-grandparent'), b = person('grandparent'), c = person('parent');
+  const partner = person('partner'), d = person('child', '2002'), e = person('sibling', '2001');
+  const aunt = person('aunt'), p = person('other grandparent'), q = person('other parent'), r = person('other child');
+  link(a, b);
+  link(a, aunt);
+  link(b, c);
+  const marriage = union('marriage', c, partner);
+  for (const child of [d, e]) {
+    link(c, child, marriage);
+    link(partner, child, marriage);
+  }
+  link(p, q);
+  link(q, r);
+  const layout = buildLayout(data, { fromYoungest: true });
+  assertSeparated(layout);
+  assertClearRoutes(layout);
+  const card = id => layout.nodes.get(id);
+  for (const row of [[b, aunt, p], [c, partner, q], [d, e, r]]) {
+    assert.equal(new Set(row.map(id => card(id).y)).size, 1);
+  }
+  assert.ok(card(a).y < card(b).y && card(b).y < card(c).y && card(c).y < card(d).y);
+  assert.ok(card(e).x < card(d).x);
+  for (const { parentId, childId } of data.parentChild) {
+    assert.equal(card(childId).depth, card(parentId).depth + 1);
+  }
+});
+
+test('ELK keeps birth order and gives each marriage its own junction', async () => {
+  const { data, person, union, link } = pedigree();
+  const parent = person('parent'), partner = person('partner');
+  const first = union('first', parent, partner, '1990');
+  const second = union('second', parent, partner, '2000');
+  const earlier = person('earlier', '2001');
+  const later = person('later', '2003');
+  const only = person('only', '1993');
+  for (const [child, marriage] of [[later, second], [only, first], [earlier, second]]) {
+    link(parent, child, marriage);
+    link(partner, child, marriage);
+  }
+  const elk = new ELK();
+  const layout = await buildElkLayout(data, elk);
+  assertSeparated(layout);
+  assertClearRoutes(layout);
+  assert.equal(layout.nodes.size, 5);
+  const a = layout.nodes.get(earlier), b = layout.nodes.get(later);
+  assert.equal(a.y, b.y);
+  assert.ok(a.x < b.x);
+  const firstChild = layout.parentConnectors.find(connector => connector.unionId === first);
+  const siblings = layout.parentConnectors.filter(connector => connector.unionId === second);
+  assert.deepEqual(siblings.map(connector => connector.childId), [earlier, later]);
+  assert.deepEqual(siblings[0].from, siblings[1].from);
+  assert.notDeepEqual(firstChild.from, siblings[0].from);
+  for (const connector of [firstChild, ...siblings]) {
+    assert.ok(layout.unionRoutes.get(connector.unionId).some(point => point.every((value, i) => value === connector.from[i])));
+  }
+  const reordered = await buildElkLayout({ ...data, parentChild: [...data.parentChild].reverse() }, elk);
+  assert.deepEqual(reordered.nodes, layout.nodes);
+  assert.deepEqual(reordered.parentConnectors, layout.parentConnectors);
+  assert.deepEqual(reordered.unionRoutes, layout.unionRoutes);
+});
+
+test('ELK routes step relationships in either direction without moving siblings to different rows', async () => {
+  const { data, person, link } = pedigree();
+  const parent = person('parent');
+  const older = person('older', '1995'), younger = person('younger', '1999');
+  link(parent, older);
+  link(parent, younger);
+  link(older, younger, null, 'step');
+  link(older, parent, null, 'step');
+  const layout = await buildElkLayout(data, new ELK());
+  assertClearRoutes(layout);
+  const a = layout.nodes.get(older), b = layout.nodes.get(younger);
+  assert.equal(a.y, b.y);
+  assert.ok(a.x < b.x);
+  const steps = layout.parentConnectors.filter(connector => connector.types.includes('step'));
+  assert.equal(steps.length, 2);
+  for (const connector of steps) {
+    const child = layout.nodes.get(connector.childId);
+    assert.ok(connector.from[0] >= a.x && connector.from[0] <= a.x + a.w);
+    assert.ok(connector.to[0] >= child.x && connector.to[0] <= child.x + child.w);
+  }
+});
+
+test('ELK Stress keeps cards separate and connects marriage branches to their junction', async () => {
+  const { data, person, union, link } = pedigree();
+  const a = person('a'), b = person('b'), child = person('child');
+  const marriage = union('marriage', a, b);
+  link(a, child, marriage);
+  link(b, child, marriage);
+  for (let i = 0; i < 12; i++) link(child, person('descendant ' + i));
+  person('isolated');
+
+  const elk = new ELK();
+  const layout = await buildElkLayout(data, elk, 'stress');
+  const cards = [...layout.nodes.values()];
+  assert.equal(cards.length, Object.keys(data.people).length);
+  for (const [i, card] of cards.entries()) {
+    assert.ok(cards.slice(i + 1).every(other =>
+      card.x + card.w <= other.x || other.x + other.w <= card.x ||
+      card.y + card.h <= other.y || other.y + other.h <= card.y));
+  }
+  const childRoute = layout.parentConnectors.find(connector => connector.childId === child);
+  assert.ok(layout.unionRoutes.get(marriage).some(point => point.every((value, i) => value === childRoute.from[i])));
+  assert.ok(layout.parentConnectors.some(({ route }) => route.some(([x, y], i) =>
+    i > 0 && x !== route[i - 1][0] && y !== route[i - 1][1])));
+  assert.equal(layout.parentConnectors.length, 13);
+});
+
+test('Stress connectors clear blocking cards and end on their own card edges', () => {
+  const left = { x: 0, y: 0, width: 20, height: 20 };
+  const right = { x: 100, y: 0, width: 20, height: 20 };
+  const blocker = { x: 40, y: 0, width: 40, height: 20 };
+  const route = stressRouter(new Map([['a', left], ['b', right], ['obstacle', blocker]]))(left, right);
+  assert.equal(route[0][0], 20);
+  assert.equal(route.at(-1)[0], 100);
+  const [firstCorner, secondCorner] = route.slice(1, -1);
+  assert.equal(firstCorner[1], secondCorner[1]);
+  assert.ok(firstCorner[1] < blocker.y || firstCorner[1] > blocker.y + blocker.height);
+  assert.ok(firstCorner[0] < blocker.x && secondCorner[0] > blocker.x + blocker.width);
+});
+
+test('Timeline places births on a linear year axis and leaves room for cards at the same date', () => {
+  const { data, person, union, link } = pedigree();
+  const parent = person('parent', '1840-01-02'), partner = person('partner', '1840-09');
+  const child = person('child', '1865'), grandchild = person('grandchild', '1890');
+  const unknown = person('unknown');
+  const marriage = union('marriage', parent, partner);
+  link(parent, child, marriage);
+  link(partner, child, marriage);
+  link(child, grandchild);
+  link(child, unknown);
+  const layout = buildTimelineLayout(data);
+  assertSeparated(layout);
+  const y = id => {
+    const node = layout.nodes.get(id);
+    return node.y + node.h / 2;
+  };
+  assert.equal(layout.timeline.firstYear, 1840);
+  assert.equal(y(parent), y(partner));
+  assert.equal(y(child) - y(parent), y(grandchild) - y(child));
+  assert.equal(y(child) - y(parent), 25 * layout.timeline.yearSpacing);
+  assert.equal(y(unknown), layout.timeline.unknownY);
+  assert.ok(y(unknown) > y(grandchild));
+  const connector = layout.parentConnectors.find(connector => connector.unionId === marriage);
+  assert.ok(layout.unionRoutes.get(marriage).some(point => point.every((value, i) => value === connector.from[i])));
+});
+
+test('Timeline has an undated row even when every birth year is missing', () => {
+  const { data, person } = pedigree();
+  const id = person('unknown');
+  const layout = buildTimelineLayout(data);
+  const card = layout.nodes.get(id);
+  assert.equal(layout.timeline.firstYear, null);
+  assert.equal(layout.timeline.lastYear, null);
+  assert.equal(layout.timeline.unknownY, card.y + card.h / 2);
 });
